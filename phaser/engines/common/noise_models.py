@@ -6,8 +6,11 @@ from numpy.typing import NDArray
 
 from phaser.hooks.solver import NoiseModel
 from phaser.plan import AmplitudeNoisePlan, AnscombeNoisePlan, PoissonNoisePlan
-from phaser.utils.num import get_array_module, Float
+from phaser.utils.num import get_array_module, Float, to_numpy
 from phaser.state import ReconsState
+
+if t.TYPE_CHECKING:
+    from phaser.utils.image import PreparedOTF, PreparedPSF
 
 
 class AmplitudeNoiseModel(NoiseModel[None]):
@@ -37,7 +40,7 @@ class AmplitudeNoiseModel(NoiseModel[None]):
         xp = get_array_module(model_wave, model_intensity, exp_patterns, mask)
         patterns = xp.maximum(exp_patterns, 0.0)
 
-        return ((
+        return (t.cast(numpy.floating,
             2. * xp.sum(mask * (
                 xp.sqrt(patterns + self.offset) - xp.sqrt(model_intensity + self.offset) - self.eps
             )**2) / self.var).astype(exp_patterns.dtype),
@@ -49,8 +52,9 @@ class AmplitudeNoiseModel(NoiseModel[None]):
         model_wave: NDArray[numpy.complexfloating],
         model_intensity: NDArray[numpy.floating],
         exp_patterns: NDArray[numpy.floating],
-        mask: NDArray[numpy.floating], 
-        state: None
+        mask: NDArray[numpy.floating],
+        state: None,
+        mtf: t.Optional[t.Union['PreparedOTF', 'PreparedPSF']] = None,
     ) -> t.Tuple[NDArray[numpy.complexfloating], None]:
         xp = get_array_module(model_wave, model_intensity, exp_patterns, mask)
         patterns = xp.maximum(exp_patterns, 0.0)
@@ -59,6 +63,9 @@ class AmplitudeNoiseModel(NoiseModel[None]):
         update *= mask # / self.var
         #print(f"min update: {xp.min(update).get()}")
         #print(f"max update: {xp.max(update).get()}")
+
+        if mtf is not None:
+            update = mtf.adjoint()(update)
 
         return (update * model_wave, state)
 
@@ -106,7 +113,8 @@ class PoissonNoiseModel(NoiseModel[None]):
         model_wave: NDArray[numpy.complexfloating],
         model_intensity: NDArray[numpy.floating],
         exp_patterns: NDArray[numpy.floating],
-        mask: NDArray[numpy.floating], 
-        state: None
+        mask: NDArray[numpy.floating],
+        state: None,
+        mtf: t.Optional[t.Union['PreparedOTF', 'PreparedPSF']] = None,
     ) -> t.Tuple[NDArray[numpy.complexfloating], None]:
         raise NotImplementedError()

@@ -5,16 +5,18 @@ import numpy
 from numpy.typing import NDArray
 
 from phaser.types import Dataclass, ReconsVar
-from phaser.utils.num import Float
 from . import Hook
 
-StateT = t.TypeVar('StateT')
-
 if t.TYPE_CHECKING:
+    from phaser.utils.num import Float
     from phaser.engines.common.simulation import SimulationState
     from phaser.execute import Observer
-    from phaser.plan import ConventionalEnginePlan, GradientEnginePlan
+    from phaser.plan import ConventionalEnginePlan, GradientEnginePlan  # noqa: F401
     from phaser.state import ReconsState
+    from phaser.utils.image import PreparedOTF, PreparedPSF
+
+
+StateT = t.TypeVar('StateT')
 
 
 class HasState(t.Protocol[StateT]):  # type: ignore
@@ -34,7 +36,7 @@ class NoiseModel(HasState[StateT], t.Protocol[StateT]):
         exp_patterns: NDArray[numpy.floating],
         mask: NDArray[numpy.floating], 
         state: StateT,
-    ) -> t.Tuple[Float, StateT]:
+    ) -> t.Tuple['Float', StateT]:
         """
         Return the calculated loss, summed across the detector and averaged across the scan.
 
@@ -47,11 +49,16 @@ class NoiseModel(HasState[StateT], t.Protocol[StateT]):
         model_wave: NDArray[numpy.complexfloating],
         model_intensity: NDArray[numpy.floating],
         exp_patterns: NDArray[numpy.floating],
-        mask: NDArray[numpy.floating], 
+        mask: NDArray[numpy.floating],
         state: StateT,
+        mtf: t.Optional[t.Union['PreparedOTF', 'PreparedPSF']] = None,
     ) -> t.Tuple[NDArray[numpy.complexfloating], StateT]:
         """
         Return the calculated wave update `chi` in reciprocal space.
+
+        If `mtf` is given, `model_intensity` has already been blurred by it; the
+        intensity-domain residual must be backprojected through `mtf.adjoint()`
+        before being combined with the (unblurred) `model_wave`.
 
         May be called in a JAX jit context, so must have no side effects.
         """
@@ -127,6 +134,7 @@ class ConventionalSolver(abc.ABC):
         patterns: NDArray[numpy.floating],
         pattern_mask: NDArray[numpy.floating],
         propagators: t.Optional[NDArray[numpy.complexfloating]],
+        mtf: t.Optional[t.Union['PreparedOTF', 'PreparedPSF']],
         update_object: bool,
         update_probe: bool,
         update_positions: bool,
@@ -161,7 +169,7 @@ class GradientSolver(HasState[StateT], t.Protocol[StateT]):
 
 
 class GradientSolverArgs(t.TypedDict):
-    plan: 'GradientEnginePlan'
+    plan: t.Optional['GradientEnginePlan']
     params: t.Iterable[ReconsVar]
 
 

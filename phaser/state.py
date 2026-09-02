@@ -1,21 +1,22 @@
 import typing as t
 
 import numpy
+from frozendict import frozendict
 from numpy.typing import NDArray
 from typing_extensions import Self
 
-from phaser.utils.num import Sampling, to_numpy, get_array_module, Float
-from phaser.utils.misc import jax_dataclass
+from phaser.utils.num import Float, Sampling, get_array_module, to_numpy
 from phaser.utils.object import ObjectSampling
+from phaser.utils.tree import field, tree_dataclass
 
 if t.TYPE_CHECKING:
-    from phaser.utils.io import HdfLike
-    from phaser.utils.image import _BoundaryMode
     from phaser.observer import Observer, ObserverSet
+    from phaser.utils.image import _InterpBoundaryMode
+    from phaser.utils.io import HdfLike
 
 
-@jax_dataclass
-class Patterns():
+@tree_dataclass
+class Patterns:
     patterns: NDArray[numpy.floating]
     """Raw diffraction patterns, with 0-frequency sample in corner"""
     pattern_mask: NDArray[numpy.floating]
@@ -27,8 +28,8 @@ class Patterns():
         )
 
 
-@jax_dataclass
-class IterState():
+@tree_dataclass
+class IterState:
     engine_num: int
     """Engine number. 1-indexed (0 means before any reconstruction)."""
     engine_iter: int
@@ -36,9 +37,9 @@ class IterState():
     total_iter: int
     """Total iteration number. 1-indexed (0 means before any iterations)."""
 
-    n_engine_iters: t.Optional[int] = None
+    n_engine_iters: int | None = None
     """Total number of iterations in this engine."""
-    n_total_iters: t.Optional[int] = None
+    n_total_iters: int | None = None
     """Total number of iterations in the reconstruction."""
 
     def to_numpy(self) -> Self:
@@ -57,18 +58,21 @@ class IterState():
         return IterState(0, 0, 0)
 
 
-@jax_dataclass(static_fields=('sampling',))
-class ProbeState():
+@tree_dataclass(static_fields=('sampling', 'meta', 'ty'))
+class PixelatedProbeState:
     sampling: Sampling
     """Probe coordinate system. See `Sampling` for more details."""
     data: NDArray[numpy.complexfloating]
     """Probe wavefunction, in realspace. Shape (modes, y, x)"""
 
+    meta: frozendict[str, t.Any] = field(default_factory=frozendict)
+    ty: t.Literal['pixelated'] = 'pixelated'
+
     def resample(
         self, new_samp: Sampling,
         rotation: float = 0.0,
         order: int = 1,
-        mode: '_BoundaryMode' = 'grid-constant',
+        mode: '_InterpBoundaryMode' = 'grid-constant',
     ) -> Self:
         new_data = self.sampling.resample(
             self.data, new_samp,
@@ -76,16 +80,16 @@ class ProbeState():
             order=order,
             mode=mode,
         )
-        return self.__class__(new_samp, new_data)
+        return self.__class__(new_samp, new_data, self.meta)
 
     def to_xp(self, xp: t.Any) -> Self:
         return self.__class__(
-            self.sampling, xp.array(self.data)
+            self.sampling, xp.asarray(self.data), self.meta
         )
 
     def to_numpy(self) -> Self:
         return self.__class__(
-            self.sampling, to_numpy(self.data)
+            self.sampling, to_numpy(self.data), self.meta
         )
 
     def copy(self) -> Self:
@@ -93,8 +97,12 @@ class ProbeState():
         return copy.deepcopy(self)
 
 
-@jax_dataclass(static_fields=('sampling',))
-class ObjectState():
+# discriminated union of probe state types
+ProbeState: t.TypeAlias = PixelatedProbeState
+
+
+@tree_dataclass(static_fields=('sampling', 'meta', 'ty'))
+class PixelatedObjectState:
     sampling: ObjectSampling
     """Object coordinate system. See `ObjectSampling` for more details."""
     data: NDArray[numpy.complexfloating]
@@ -105,20 +113,23 @@ class ObjectState():
     Length < 2 for single slice, equal to the number of slices otherwise.
     """
 
+    meta: frozendict[str, t.Any] = field(default_factory=frozendict)
+    ty: t.Literal['pixelated'] = 'pixelated'
+
     def to_xp(self, xp: t.Any) -> Self:
         return self.__class__(
-            self.sampling, xp.array(self.data), xp.array(self.thicknesses)
+            self.sampling, xp.asarray(self.data), xp.asarray(self.thicknesses), self.meta,
         )
 
     def to_numpy(self) -> Self:
         return self.__class__(
-            self.sampling, to_numpy(self.data), to_numpy(self.thicknesses)
+            self.sampling, to_numpy(self.data), to_numpy(self.thicknesses), self.meta,
         )
 
     def zs(self) -> NDArray[numpy.floating]:
         xp = get_array_module(self.thicknesses)
         if len(self.thicknesses) < 2:
-            return xp.array([0.], dtype=self.thicknesses.dtype)
+            return xp.asarray([0.], dtype=self.thicknesses.dtype)
         return xp.cumsum(self.thicknesses) - self.thicknesses
 
     def copy(self) -> Self:
@@ -126,62 +137,71 @@ class ObjectState():
         return copy.deepcopy(self)
 
 
-@jax_dataclass
-class ProgressState:
-    iters: NDArray[numpy.integer]
-    """Iterations error measurements were taken at."""
-    detector_errors: NDArray[numpy.floating]
-    """Detector error measurements at those iterations"""
+# discriminated union of object state types
+ObjectState: t.TypeAlias = PixelatedObjectState
+
+
+@tree_dataclass(static_fields=('meta',))
+class ScanState:
+    data: NDArray[numpy.floating]
+    """Scan coordinates (y, x), in length units. Shape (..., 2)"""
+    initial: NDArray[numpy.floating]
+    """Inital scan coordinates (y, x), in length units."""
+    tilt: NDArray[numpy.floating] | None = None
+    """Tilt angles (y, x) per scan position, in mrad. Shape (..., 2)"""
+
+    meta: frozendict[str, t.Any] = field(default_factory=frozendict)
+
+    def to_xp(self, xp: t.Any) -> Self:
+        return self.__class__(
+            xp.asarray(self.data),
+            xp.asarray(self.initial),
+            None if self.tilt is None else xp.asarray(self.tilt),
+            self.meta,
+        )
 
     def to_numpy(self) -> Self:
         return self.__class__(
-            to_numpy(self.iters), to_numpy(self.detector_errors)
+            to_numpy(self.data),
+            to_numpy(self.initial),
+            None if self.tilt is None else to_numpy(self.tilt),
+            self.meta,
         )
 
     def copy(self) -> Self:
         import copy
         return copy.deepcopy(self)
 
-    @staticmethod
-    def empty() -> 'ProgressState':
-        return ProgressState(
-            numpy.array([], dtype=numpy.uint64),
-            numpy.array([], dtype=numpy.float64),
-        )
 
-    # TODO: this is a hack to prevent JIT recompilation.
-    def __hash__(self) -> int:
-        return id(self)
+@tree_dataclass
+class ProgressState:
+    iters: list[int] = field(default_factory=list)
+    """Iterations error measurements were taken at."""
+    values: list[float] = field(default_factory=list)
+    """Detector error measurements at those iterations"""
 
-    def __eq__(self, other: t.Any) -> bool:
-        if type(self) is not type(other):
-            return False
-        xp = get_array_module(self.iters, other.iters)
-        return (
-            xp.array_equal(self.iters, other.iters) and
-            xp.array_equal(self.detector_errors, other.detector_errors)
-        )
+    def copy(self) -> Self:
+        import copy
+        return copy.deepcopy(self)
 
-@jax_dataclass(kw_only=True, static_fields=('progress',))
+
+@tree_dataclass(kw_only=True, drop_fields=('progress',))
 class ReconsState:
     iter: IterState
     wavelength: Float
 
     probe: ProbeState
     object: ObjectState
-    scan: NDArray[numpy.floating]
-    """Scan coordinates (y, x), in length units. Shape (..., 2)"""
-    tilt: t.Optional[NDArray[numpy.floating]] = None
-    """Tilt angles (y, x) per scan position, in mrad. Shape (..., 2)"""
-    progress: ProgressState
+    scan: ScanState
+
+    progress: dict[str, ProgressState] = field(default_factory=dict)
 
     def to_xp(self, xp: t.Any) -> Self:
         return self.__class__(
             iter=self.iter,
             probe=self.probe.to_xp(xp),
             object=self.object.to_xp(xp),
-            scan=xp.array(self.scan),
-            tilt=None if self.tilt is None else xp.array(self.tilt),
+            scan=self.scan.to_xp(xp),
             progress=self.progress,
             wavelength=self.wavelength,
         )
@@ -191,9 +211,8 @@ class ReconsState:
             iter=self.iter.to_numpy(),
             probe=self.probe.to_numpy(),
             object=self.object.to_numpy(),
-            scan=to_numpy(self.scan),
-            tilt=None if self.tilt is None else to_numpy(self.tilt),
-            progress=self.progress.to_numpy(),
+            scan=self.scan.to_numpy(),
+            progress=self.progress,
             wavelength=float(self.wavelength),
         )
 
@@ -211,27 +230,24 @@ class ReconsState:
         return hdf5_read_state(file).to_complete()
 
 
-@jax_dataclass(kw_only=True, static_fields=('progress',))
+@tree_dataclass(kw_only=True, static_fields=('progress',))
 class PartialReconsState:
-    iter: t.Optional[IterState] = None
-    wavelength: t.Optional[Float] = None
+    iter: IterState | None = None
+    wavelength: Float | None = None
 
-    probe: t.Optional[ProbeState] = None
-    object: t.Optional[ObjectState] = None
-    scan: t.Optional[NDArray[numpy.floating]] = None
-    """Scan coordinates (y, x), in length units. Shape (..., 2)"""
-    tilt: t.Optional[NDArray[numpy.floating]] = None
-    progress: t.Optional[ProgressState] = None
+    probe: ProbeState | None = None
+    object: ObjectState | None = None
+    scan: ScanState | None = None
+    progress: dict[str, ProgressState] | None = None
 
     def to_numpy(self) -> Self:
         return self.__class__(
             iter=self.iter.to_numpy() if self.iter is not None else None,
             probe=self.probe.to_numpy() if self.probe is not None else None,
             object=self.object.to_numpy() if self.object is not None else None,
-            scan=to_numpy(self.scan) if self.scan is not None else None,
-            tilt=to_numpy(self.tilt) if self.tilt is not None else None,
-            progress=self.progress.to_numpy() if self.progress is not None else None,
+            scan=self.scan.to_numpy() if self.scan is not None else None,
             wavelength=float(self.wavelength) if self.wavelength is not None else None,
+            progress=self.progress,
         )
 
     def to_complete(self) -> ReconsState:
@@ -239,15 +255,15 @@ class PartialReconsState:
         if len(missing):
             raise ValueError(f"ReconsState missing {', '.join(map(repr, missing))}")
 
-        progress = self.progress if self.progress is not None else ProgressState.empty()
+        progress = self.progress if self.progress is not None else {}
         iter = self.iter if self.iter is not None else IterState.empty()
 
         return ReconsState(
             wavelength=t.cast(Float, self.wavelength),
             probe=t.cast(ProbeState, self.probe),
             object=t.cast(ObjectState, self.object),
-            scan=t.cast(NDArray[numpy.floating], self.scan),
-            tilt=self.tilt, progress=progress, iter=iter,
+            scan=t.cast(ScanState, self.scan),
+            progress=progress, iter=iter,
         )
 
     def write_hdf5(self, file: 'HdfLike'):
@@ -260,12 +276,19 @@ class PartialReconsState:
         return hdf5_read_state(file)
 
 
-@jax_dataclass(static_fields=('name', 'observer'))
+@tree_dataclass(static_fields=('name', 'observer'))
 class PreparedRecons:
     patterns: Patterns
     state: ReconsState
     name: str
     observer: 'ObserverSet'
+
+    def to_xp(self, xp: t.Any) -> Self:
+        return self.__class__(
+            self.patterns,
+            self.state.to_xp(xp),
+            self.name, self.observer,
+        )
 
     def to_numpy(self) -> Self:
         return self.__class__(
@@ -282,3 +305,18 @@ class PreparedRecons:
             observers.extend(observer)
 
         return self.__class__(self.patterns, self.state, self.name, ObserverSet(observers))
+
+
+__all__ = [
+    'IterState',
+    'ObjectState',
+    'PartialReconsState',
+    'Patterns',
+    'PixelatedObjectState',
+    'PixelatedProbeState',
+    'PreparedRecons',
+    'ProbeState',
+    'ProgressState',
+    'ReconsState',
+    'ScanState',
+]

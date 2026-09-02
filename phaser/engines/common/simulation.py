@@ -3,18 +3,40 @@ import logging
 import typing as t
 
 import numpy
-from numpy.typing import NDArray, DTypeLike
+from numpy.typing import NDArray
 from typing_extensions import Self
 
-from phaser.utils.num import (
-    get_array_module, to_real_dtype, to_complex_dtype,
-    fft2, ifft2, is_jax, to_numpy, block_until_ready, ufunc_outer
-)
-from phaser.utils.misc import FloatKey, jax_dataclass, create_compact_groupings, create_sparse_groupings, shuffled
-from phaser.utils.optics import fresnel_propagator, fourier_shift_filter
-from phaser.state import ReconsState
-from phaser.hooks.solver import NoiseModel
+from phaser.hooks.filter import FilterArgs, FilterHook
 from phaser.hooks.regularization import GroupConstraint, IterConstraint, StateT
+from phaser.hooks.solver import NoiseModel
+from phaser.plan import MtfPlan
+from phaser.state import ReconsState
+from phaser.utils.image import (
+    PreparedOTF,
+    PreparedPSF,
+    prepare_convolve2d,
+    prepare_convolve2d_recip,
+)
+from phaser.utils.misc import (
+    FloatKey,
+    create_compact_groupings,
+    create_sparse_groupings,
+    shuffled,
+)
+from phaser.utils.num import (
+    Sampling,
+    block_until_ready,
+    fft2,
+    get_array_module,
+    ifft2,
+    is_jax,
+    to_complex_dtype,
+    to_numpy,
+    to_real_dtype,
+    ufunc_outer,
+)
+from phaser.utils.optics import fourier_shift_filter, fresnel_propagator
+from phaser.utils.tree import tree_dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +53,8 @@ class GroupManager:
         self.compact = compact
         self.seed = seed
         self.groups: t.Optional[t.List[NDArray[numpy.int64]]] = None
-        self.n_groups: int = int(numpy.ceil(numpy.prod(scan.shape[:-1]) / self.grouping))
+        self.n_pos = numpy.prod(scan.shape[:-1])
+        self.n_groups: int = int(numpy.ceil(self.n_pos / self.grouping))
 
     def _make(self, scan: NDArray[numpy.floating], i: int = 0) -> t.List[NDArray[numpy.int64]]:
         if self.compact:
@@ -72,18 +95,19 @@ def stream_patterns(
             break
 
     while len(buf) > 0:
-        (group, group_patterns) = buf.popleft()
-        yield group, block_until_ready(group_patterns)
-
         # attempt to feed queue
         try:
             group = next(it)
             buf.append((group, xp.asarray(patterns[tuple(group)])))
         except StopIteration:
-            continue
+            pass
+
+        # and yield from front of queue
+        (group, group_patterns) = buf.popleft()
+        yield group, block_until_ready(group_patterns)
 
 
-@jax_dataclass(init=False, static_fields=('xp', 'dtype', 'noise_model', 'group_constraints', 'iter_constraints'), drop_fields=('ky', 'kx'))
+@tree_dataclass(init=False, static_fields=('xp', 'dtype', 'noise_model', 'group_constraints', 'iter_constraints'), drop_fields=('ky', 'kx'))
 class SimulationState:
     state: ReconsState
 
@@ -99,7 +123,7 @@ class SimulationState:
     iter_constraint_states: t.Tuple[t.Any, ...]
 
     xp: t.Any
-    dtype: DTypeLike
+    dtype: t.Type[numpy.floating]
     start_iter: int
 
     def __init__(
@@ -109,7 +133,7 @@ class SimulationState:
         group_constraints: t.Tuple[GroupConstraint[t.Any], ...],
         iter_constraints: t.Tuple[IterConstraint[t.Any], ...],
         xp: t.Any,
-        dtype: DTypeLike,
+        dtype: t.Type[numpy.floating],
         noise_model_state: t.Optional[t.Any] = None,
         group_constraint_states: t.Optional[t.Tuple[t.Any, ...]] = None,
         iter_constraint_states: t.Optional[t.Tuple[t.Any, ...]] = None,
@@ -190,6 +214,29 @@ def make_propagators(state: ReconsState, bwlim_frac: t.Optional[float] = 2/3) ->
     )
 
 
+def prepare_mtf(
+    mtf: t.Union[MtfPlan, FilterHook],
+    state: ReconsState,
+    dtype: t.Type[numpy.floating],
+    xp: t.Any,
+) -> t.Union[PreparedOTF[numpy.inexact], PreparedPSF[numpy.floating]]:
+    """
+    Prepare a detector MTF for application to simulated diffraction pattern
+    intensities, sampled at `state.probe.sampling`'s shape (in detector pixels).
+    """
+    mtf_args: FilterArgs = {'wavelength': float(state.wavelength)}
+    if isinstance(mtf, MtfPlan):
+        filt = mtf.filter(mtf_args)
+        domain = mtf.domain
+    else:
+        filt = mtf(mtf_args)
+        domain = 'recip'
+
+    samp = Sampling(state.probe.data.shape[-2:], sampling=(1., 1.))
+    prepare = prepare_convolve2d if domain == 'real' else prepare_convolve2d_recip
+    return prepare(filt, samp, xp=xp, dtype=dtype)
+
+
 def tilt_propagators(
     ky: NDArray[numpy.floating], kx: NDArray[numpy.floating],
     state: ReconsState, 
@@ -246,7 +293,7 @@ def cutout_group(
     """Returns (probe, obj) in the cutout region"""
     probes = state.probe.data
 
-    group_scan = state.scan[tuple(group)]
+    group_scan = state.scan.data[tuple(group)]
     group_obj = state.object.sampling.get_view_at_pos(state.object.data, group_scan, probes.shape[-2:])
     # group probes in real space
     # shape (len(group), 1, Ny, Nx)
@@ -263,7 +310,8 @@ def cutout_group(
 def slice_forwards(
     props: t.Optional[NDArray[numpy.complexfloating]],
     state: StateT,
-    f: t.Callable[[int, t.Optional[NDArray[numpy.complexfloating]], StateT], StateT]
+    f: t.Callable[[int, t.Optional[NDArray[numpy.complexfloating]], StateT], StateT], *,
+    jit_unroll_slices: t.Union[int, bool] = False,
 ) -> StateT:
     if props is None:
         return f(0, None, state)
@@ -276,7 +324,7 @@ def slice_forwards(
             new_state = f(slice_i, props[slice_i], carry)
             return new_state, None
 
-        state, _ = jax.lax.scan(step_fn, state, jax.numpy.arange(n_slices - 1))
+        state, _ = jax.lax.scan(step_fn, state, jax.numpy.arange(n_slices - 1), unroll=jit_unroll_slices)
         return f(n_slices - 1, None, state)
 
     # fallback numpy mode
@@ -288,7 +336,8 @@ def slice_forwards(
 def slice_backwards(
     props: t.Optional[NDArray[numpy.complexfloating]],
     state: StateT,
-    f: t.Callable[[int, t.Optional[NDArray[numpy.complexfloating]], StateT], StateT]
+    f: t.Callable[[int, t.Optional[NDArray[numpy.complexfloating]], StateT], StateT],
+    jit_unroll_slices: t.Union[int, bool] = False,
 ) -> StateT:
     if props is None:
         return f(0, None, state)
@@ -297,7 +346,10 @@ def slice_backwards(
 
     if is_jax(props):
         import jax
-        state = jax.lax.fori_loop(1, n_slices, lambda i, state: f(n_slices - i, props[n_slices - i - 1], state), state, unroll=False)
+        state = jax.lax.fori_loop(
+            1, n_slices, lambda i, state: f(n_slices - i, props[n_slices - i - 1], state), state,
+            unroll=jit_unroll_slices
+        )
         return f(0, None, state)
 
     for slice_i in range(n_slices - 1, 0, -1):

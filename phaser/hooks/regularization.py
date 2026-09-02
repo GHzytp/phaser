@@ -1,15 +1,14 @@
 import typing as t
-
 import numpy
 from numpy.typing import NDArray
 
 from phaser.types import Dataclass
-from phaser.utils.num import Float
 from . import Hook
 
 from .solver import HasState, StateT
 
 if t.TYPE_CHECKING:
+    from phaser.utils.num import Float
     from phaser.state import ReconsState
 
 
@@ -27,12 +26,15 @@ class IterConstraint(HasState[StateT], t.Protocol[StateT]):
 
 @t.runtime_checkable
 class CostRegularizer(HasState[StateT], t.Protocol[StateT]):
-    def calc_loss_group(self, group: NDArray[numpy.integer], sim: 'ReconsState', state: StateT) -> t.Tuple[Float, StateT]:
+    def name(self) -> str:
+        ...
+
+    def calc_loss_group(self, group: NDArray[numpy.integer], sim: 'ReconsState', state: StateT) -> t.Tuple['Float', StateT]:
         ...
 
 
 class ClampObjectAmplitudeProps(Dataclass):
-    amplitude: float = 1.1
+    amplitude: t.Union[float, t.List[t.Optional[float]]] = 1.1
 
 
 class LimitProbeSupportProps(Dataclass):
@@ -52,7 +54,7 @@ class UnstructuredGaussianProps(Dataclass):
 
 
 class TiltGaussianProps(UnstructuredGaussianProps):
-    attr_path: t.Literal['tilt'] = 'tilt'
+    attr_path: t.Literal['scan.tilt'] = 'scan.tilt'
 
 
 class OPRGaussianProps(UnstructuredGaussianProps):
@@ -68,6 +70,10 @@ class GaussianProps(Dataclass):
     weight: float = 0.9
 
 
+class NonNegObjectPhaseProps(Dataclass):
+    weight: float = 1.0
+
+
 class IterConstraintHook(Hook[None, IterConstraint]):
     known = {
         'clamp_object_amplitude': ('phaser.engines.common.regularizers:ClampObjectAmplitude', ClampObjectAmplitudeProps),
@@ -78,6 +84,8 @@ class IterConstraintHook(Hook[None, IterConstraint]):
         'opr_gaussian': ('phaser.engines.common.regularizers:UnstructuredGaussian', OPRGaussianProps),
         'tilt_gaussian': ('phaser.engines.common.regularizers:UnstructuredGaussian', TiltGaussianProps),
         'remove_phase_ramp': ('phaser.engines.common.regularizers:RemovePhaseRamp', t.Dict[str, t.Any]),
+        'nonneg_object_phase': ('phaser.engines.common.regularizers:NonNegObjectPhase', NonNegObjectPhaseProps),
+
     }
 
 
@@ -88,6 +96,8 @@ class GroupConstraintHook(Hook[None, GroupConstraint]):
         'obj_low_pass': ('phaser.engines.common.regularizers:ObjLowPass', ObjLowPassProps),
         'obj_gaussian': ('phaser.engines.common.regularizers:ObjGaussian', GaussianProps),
         'remove_phase_ramp': ('phaser.engines.common.regularizers:RemovePhaseRamp', t.Dict[str, t.Any]),
+        'nonneg_object_phase': ('phaser.engines.common.regularizers:NonNegObjectPhase', NonNegObjectPhaseProps),
+
     }
 
 

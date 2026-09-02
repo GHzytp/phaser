@@ -1,18 +1,19 @@
+import typing as t
 from dataclasses import dataclass
 from functools import lru_cache
-import typing as t
 
 import numpy
-import pane
-from pane.converters import Converter, make_converter, ConverterHandlers, ErrorNode
-from pane.annotations import ConvertAnnotation
-from pane.errors import ParseInterrupt, WrongTypeError
-from pane.util import pluralize, list_phrase
 from typing_extensions import Self
 
+import pane
+from pane.annotations import Condition, ConvertAnnotation
+from pane.converters import Converter, ConverterHandlers, ErrorNode, make_converter
+from pane.errors import ParseInterrupt, WrongTypeError
+from pane.util import list_phrase, pluralize
+
 if t.TYPE_CHECKING:
+    from phaser.hooks.schedule import Flag, FlagArgs, FlagLike, Schedule, ScheduleLike
     from phaser.state import ReconsState
-    from phaser.hooks.schedule import FlagArgs, FlagLike, ScheduleLike
 
 T = t.TypeVar('T')
 
@@ -75,8 +76,8 @@ class _ReconsVarsAnnotation(ConvertAnnotation):
         return hash(self.__class__.__name__)
 
 
-BackendName: t.TypeAlias = t.Literal['cuda', 'cupy', 'jax', 'cpu', 'numpy']
-ReconsVar: t.TypeAlias = t.Literal['object', 'probe', 'positions', 'tilt']
+BackendName: t.TypeAlias = t.Literal['cupy', 'jax', 'torch', 'numpy']
+ReconsVar: t.TypeAlias = t.Literal['object', 'probe', 'positions', 'tilt', 'positions_affine', 'positions_line']
 
 ReconsVars: t.TypeAlias = t.Annotated[t.FrozenSet[ReconsVar], _ReconsVarsAnnotation()]
 EmptyDict: t.TypeAlias = t.Annotated[t.Dict[t.NoReturn, t.NoReturn], _EmptyDictAnnotation()]
@@ -84,7 +85,7 @@ EmptyDict: t.TypeAlias = t.Annotated[t.Dict[t.NoReturn, t.NoReturn], _EmptyDictA
 
 class EarlyTermination(BaseException):
     def __init__(self, state: 'ReconsState', continue_next_engine: bool = False):
-        self.state: 'ReconsState' = state
+        self.state: ReconsState = state
         self.continue_next_engine: bool = continue_next_engine
 
 
@@ -122,7 +123,91 @@ class SliceTotal(Dataclass):
 Slices: t.TypeAlias = t.Union[SliceList, SliceStep, SliceTotal]
 
 
-class Flag(Dataclass):
+class ComplexCartesian(pane.PaneBase, kw_only=True):
+    re: float
+    im: float = 0.0
+
+    def __complex__(self) -> complex:
+        return complex(self.re, self.im)
+
+class ComplexPolar(pane.PaneBase, kw_only=True):
+    mag: float
+    angle: float = 0.0  # degrees
+
+    def __complex__(self) -> complex:
+        theta = numpy.deg2rad(self.angle)
+        return self.mag * complex(numpy.cos(theta), numpy.sin(theta))
+
+
+class Krivanek(pane.PaneBase):
+    n: int
+    m: int
+    scale_factor: float = 1.0
+
+    def __post_init__(self):
+        if (
+            self.n < 0 or self.m < 0 or
+            self.m > self.n + 1 or
+            self.m % 2 + self.n % 2 != 1
+        ):
+            raise ValueError(f"Invalid Krivanek aberration n={self.n} m={self.m}")
+
+    @staticmethod
+    def from_known(s: str) -> 'Krivanek':
+        try:
+            return _KNOWN_ABERRATIONS[s.lower()]
+        except (KeyError, TypeError):
+            raise ValueError(f"Unknown aberration '{s}'") from None
+
+class KrivanekComplex(Krivanek, kw_only=True):
+    val: complex
+
+    def __complex__(self) -> complex:
+        return self.val
+
+class KrivanekCartesian(Krivanek, ComplexCartesian, kw_only=True):
+    ...
+
+class KrivanekPolar(Krivanek, ComplexPolar, kw_only=True):
+    ...
+
+
+_KNOWN_ABERRATIONS: t.Dict[str, Krivanek] = {
+    'c1': Krivanek.make_unchecked(1, 0),
+    'a1': Krivanek.make_unchecked(1, 2),
+    'b2': Krivanek.make_unchecked(2, 1, 3.0),  # C_21 = 3*B2
+    'a2': Krivanek.make_unchecked(2, 3),
+    'c3': Krivanek.make_unchecked(3, 0),
+    's3': Krivanek.make_unchecked(3, 2, 3.0),  # C_32 = 3*S3
+    'a3': Krivanek.make_unchecked(3, 4),
+    'b4': Krivanek.make_unchecked(4, 1, 4.0),  # C_41 = 4*B4
+    'd4': Krivanek.make_unchecked(4, 3, 4.0),  # C_43 = 4*D4
+    'a4': Krivanek.make_unchecked(4, 5),
+    'c5': Krivanek.make_unchecked(5, 0),
+}
+
+KnownAberration: t.TypeAlias = t.Annotated[str, Condition(
+    lambda s: s.lower() in _KNOWN_ABERRATIONS,
+    'known aberration',
+    lambda exp, plural: pluralize('known aberration', plural)
+)]
+
+Aberration: t.TypeAlias = t.Union[
+    t.Dict[KnownAberration, t.Union[complex, ComplexCartesian, ComplexPolar]],
+    KrivanekComplex, KrivanekCartesian, KrivanekPolar,
+]
+
+def process_aberrations(aberrations: t.Iterable[Aberration]) -> t.Iterator[KrivanekComplex]:
+    for ab in aberrations:
+        if isinstance(ab, dict):
+            for known, val in ab.items():
+                ty = Krivanek.from_known(known)
+                yield KrivanekComplex(ty.n, ty.m, val=ty.scale_factor * complex(val))
+        else:
+            yield KrivanekComplex(ab.n, ab.m, val=complex(ab))
+
+
+class SimpleFlag(Dataclass):
     after: int = 0
     every: int = 1
     before: t.Optional[int] = None
@@ -154,21 +239,21 @@ class _ConstFlag:
 
 
 @lru_cache
-def process_flag(flag: 'FlagLike') -> t.Callable[['FlagArgs'], bool]:
+def process_flag(flag: 'FlagLike') -> 'Flag':
     if isinstance(flag, bool):
         return _ConstFlag(flag)
     return flag
 
 
 @lru_cache
-def process_schedule(schedule: 'ScheduleLike') -> t.Callable[['FlagArgs'], float]:
+def process_schedule(schedule: 'ScheduleLike') -> 'Schedule':
     if isinstance(schedule, (int, float)):
         return lambda _: schedule
     return schedule
 
 
 def flag_any_true(flag: t.Callable[['FlagArgs'], bool], niter: int) -> bool:
-    if isinstance(flag, Flag):
+    if isinstance(flag, SimpleFlag):
         return flag.any_true(niter)
     elif isinstance(flag, _ConstFlag):
         return flag.val
@@ -303,6 +388,12 @@ class _ReconsVarsConverter(Converter[t.FrozenSet[ReconsVar]]):
 
 
 __all__ = [
-    'BackendName', 'Dataclass', 'Slices', 'Flag',
-    'process_flag', 'flag_any_true',
+    'cast_length', 'BackendName', 'ReconsVar', 'ReconsVars',
+    'EmptyDict', 'EarlyTermination', 'Dataclass',
+    'SliceList', 'SliceStep', 'SliceTotal', 'Slices',
+    'ComplexCartesian', 'ComplexPolar',
+    'Krivanek', 'KrivanekComplex', 'KrivanekCartesian', 'KrivanekPolar',
+    'KnownAberration', 'Aberration', 'process_aberrations',
+    'SimpleFlag', 'process_flag', 'process_schedule', 'flag_any_true',
+    'IsVersion', 'Version',
 ]

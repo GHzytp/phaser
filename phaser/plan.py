@@ -1,12 +1,38 @@
-from pathlib import Path
 import typing as t
+from pathlib import Path
 
-from .types import Dataclass, Slices, BackendName, Flag, ReconsVars, IsVersion, EmptyDict
-from .hooks import RawDataHook, ProbeHook, ObjectHook, ScanHook, EngineHook, PostInitHook, PostLoadHook, TiltHook
-from .hooks.solver import NoiseModelHook, ConventionalSolverHook, PositionSolverHook, GradientSolverHook
+from .hooks import (
+    EngineHook,
+    ObjectHook,
+    PostInitHook,
+    PostLoadHook,
+    ProbeHook,
+    RawDataHook,
+    ScanHook,
+    TiltHook,
+)
+from .hooks.filter import FilterHook
+from .hooks.regularization import (
+    CostRegularizerHook,
+    GroupConstraintHook,
+    IterConstraintHook,
+)
 from .hooks.schedule import FlagLike, ScheduleLike
-from .hooks.regularization import IterConstraintHook, GroupConstraintHook, CostRegularizerHook
-
+from .hooks.solver import (
+    ConventionalSolverHook,
+    GradientSolverHook,
+    NoiseModelHook,
+    PositionSolverHook,
+)
+from .types import (
+    BackendName,
+    Dataclass,
+    EmptyDict,
+    IsVersion,
+    ReconsVars,
+    SimpleFlag,
+    Slices,
+)
 
 SaveType: t.TypeAlias = t.Literal[
     'probe', 'probe_mag', 'probe_recip', 'probe_recip_mag',
@@ -40,6 +66,11 @@ class SaveOptions(Dataclass, kw_only=True):
     hdf5_fmt: str = "iter{iter.total_iter:03}.h5"
 
 
+class MtfPlan(Dataclass, kw_only=True):
+    filter: FilterHook
+    domain: t.Literal['real', 'recip'] = 'recip'
+
+
 class EnginePlan(Dataclass, kw_only=True):
     sim_shape: t.Optional[t.Tuple[int, int]] = None
     resize_method: t.Literal['pad_crop', 'resample'] = 'pad_crop'
@@ -57,14 +88,28 @@ class EnginePlan(Dataclass, kw_only=True):
     grouping: t.Optional[int] = None
     compact: bool = False
     shuffle_groups: t.Optional[FlagLike] = None
-    buffer_n_groups: int = 2
+    buffer_n_groups: t.Optional[int] = 2
+    """
+    How many groups of patterns to buffer onto the device simultaneously.
+    Set to 0 to disable buffering, or `None` (`~` in YAML) to preload the
+    entire dataset to the device.
+    """
+
+    jit_unroll_slices: t.Union[None, bool, int] = None
+    """
+    Slices to unroll during JIT compilation (JAX backend only).
+    Larger unrolling may be faster, at the expense of increased compilation time.
+
+    `True` or `0` unrolls all slices, `False` or `1` disables unrolling.
+    Defaults vary by engine (currently `10` for the gradient descent engine).
+    """
 
     update_probe: FlagLike = True
     update_object: FlagLike = True
     update_positions: FlagLike = False
     update_tilt: FlagLike = False
 
-    calc_error: FlagLike = Flag(every=1)
+    calc_error: FlagLike = SimpleFlag(every=1)
     calc_error_fraction: float = 0.1
 
     save: FlagLike = False
@@ -80,7 +125,11 @@ class EnginePlan(Dataclass, kw_only=True):
     (smooths over ~1/smoothing iterations)
     """
 
+    check_every_group: bool = False
     send_every_group: bool = False
+
+    mtf: t.Union[MtfPlan, FilterHook, None] = None
+    """Detector MTF to apply to simulated diffraction pattern."""
 
 
 class AmplitudeNoisePlan(Dataclass, kw_only=True):
@@ -132,7 +181,7 @@ class ConventionalEnginePlan(EnginePlan, kw_only=True):
     iter_constraints: t.List[IterConstraintHook]
 
 
-class GradientEnginePlan(EnginePlan):
+class GradientEnginePlan(EnginePlan, kw_only=True):
     noise_model: NoiseModelHook
     solvers: t.Dict[ReconsVars, GradientSolverHook]
 
@@ -180,6 +229,7 @@ class ReconsPlan(Dataclass, kw_only=True):
     name: str
 
     backend: t.Optional[BackendName] = None
+    device: t.Optional[str] = None
     dtype: t.Literal['float32', 'float64'] = 'float32'
 
     wavelength: t.Optional[float] = None

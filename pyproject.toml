@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phaserEM"
-version = "0.2"
+dynamic = ["version"]
 authors = [
   {name = "Colin Gilgenbach", email = "hexane@mit.edu"}
 ]
@@ -28,16 +28,21 @@ classifiers = [
 
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.22,<2.6",  # tested on 1.26, 2.3
+    "numpy>=2.0,<2.7",  # tested on 2.4
     "scipy>=1.7.0,<1.19", # tested on 1.11, 1.16
     "matplotlib~=3.8",
     "h5py~=3.8",
     "pyyaml>=5.3.1",
     "click~=8.1.0",
+    "frozendict~=2.4.7",
     "rich>=12.0.0,<15",
     "tifffile>=2023.8.25",
-    "py-pane==0.11.3",
+    "optree>=0.13.0",
+    "py-pane==0.11.7",
     "typing_extensions~=4.7",
+    "platformdirs>=4.8.0",
+    "PyYAML>=6.0",
+    "lxml>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -54,16 +59,28 @@ cupy12 = [
     "cupy-cuda12x>=12.0.0",
     "pynvml>=11.0.0",
 ]
+cupy13 = [
+    "cupy-cuda13x>=12.0.0",
+    "pynvml>=11.0.0",
+]
 jax = [
     # 0.4.25 is last version supporting cuda 11.8, we need to support it.
-    # tested on 0.4.25, 0.5.x, 0.6.x, and 0.7.0
-    "jax>=0.4.25,<0.8",
+    # tested on 0.4.25, 0.5.x, 0.6.x, 0.7.0, and 0.10.0
+    "jax>=0.4.25,<0.11",
     "optax>=0.2.2",
+]
+torch = [
+    "torch>=2.8.0",
 ]
 web = [
     "Quart>=0.20.0",
     "backoff==2.2.1",
     "requests>=2.31.0",
+    "anywidget>=0.11.0",
+    "jupyter-ws-tunnel==0.1.3",
+    # pinned exactly, monkeypatch to disable websocket compression
+    # Diff `Handshake.accept` against the new version before bumping this pin.
+    "hypercorn==0.18.0",
 ]
 docs = [
     "mkdocs==1.6.1",
@@ -79,22 +96,28 @@ Repository = "https://github.com/hexane360/phaser.git"
 Documentation = "https://hexane360.github.io/phaser/dev"
 
 [project.scripts]
-phaser = "phaser.main:cli"
+phaser = "phaser.cli:cli"
+
+[tool.setuptools.dynamic]
+version = {attr = "phaser.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["phaser*"]
 
 [tool.setuptools.package-data]
-"phaser.web.dist" = ["*"]
+"phaser.web.static" = ["*"]
+"phaser.web.static.dist" = ["*"]
 "phaser.web.templates" = ["*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "cuda: Run on CUDA backend",
+    "cupy: Run on Cupy backend",
     "jax: Run on jax backend",
-    "cpu: Run on CPU backend",
+    "torch: Run on PyTorch backend",
+    "numpy: Run on numpy backend",
     "slow: mark a test as slow",
+    "web: Tests for web server",
 
     "expected_filename: Filename to load expected result from",
 ]
@@ -104,7 +127,30 @@ typeCheckingMode = "standard"
 exclude = [
     "tests", "notebooks/", "examples", ".github",
     "build", "venv", ".venv",
-    "**/node_modules", "**/__pycache__"
+    "**/node_modules", "**/__pycache__", "**/.*",
 ]
 
 reportIncompatibleMethodOverride = "information"
+
+[tool.ruff.lint]
+ignore = [
+    # should migrate these eventually
+    "UP006", "UP007", "UP045",
+    # allow root logger
+    "LOG015",
+    # allow dict(key=val), list(iterable)
+    "C408", "C400",
+    # allow unused noqa
+    "RUF100",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ignores for notebooks
+"**/*.ipynb" = [
+    "I001", "E741",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "pane", "jupyter_ws_tunnel",
+]

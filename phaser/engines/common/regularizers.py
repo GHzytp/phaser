@@ -1,7 +1,7 @@
 from functools import partial
 import logging
+from math import prod
 import typing as t
-
 import numpy
 from numpy.typing import NDArray
 
@@ -9,9 +9,10 @@ from phaser.utils.num import (
     get_array_module, get_scipy_module, Float, unstack,
     jit, fft2, ifft2, abs2, xp_is_jax, to_real_dtype, to_numpy
 )
+from phaser.utils.image import convolve1d
 from phaser.state import ReconsState
 from phaser.hooks.regularization import (
-    ClampObjectAmplitudeProps, LimitProbeSupportProps,
+    ClampObjectAmplitudeProps, LimitProbeSupportProps, NonNegObjectPhaseProps,
     RegularizeLayersProps, ObjLowPassProps, GaussianProps,
     CostRegularizerProps, TVRegularizerProps, UnstructuredGaussianProps
 )
@@ -19,7 +20,14 @@ from phaser.hooks.regularization import (
 
 class ClampObjectAmplitude:
     def __init__(self, args: None, props: ClampObjectAmplitudeProps):
-        self.amplitude = props.amplitude
+        self.min: t.Optional[float]
+        self.max: t.Optional[float]
+
+        if isinstance(props.amplitude, list):
+            self.min, self.max = props.amplitude
+        else:
+            self.min = None
+            self.max = props.amplitude
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -28,19 +36,33 @@ class ClampObjectAmplitude:
         return self.apply_iter(sim, state)
 
     def apply_iter(self, sim: ReconsState, state: None) -> t.Tuple[ReconsState, None]:
-        amp = to_real_dtype(sim.object.data.dtype)(self.amplitude)
-        sim.object.data = clamp_amplitude(sim.object.data, amp)
+        cast = to_real_dtype(sim.object.data.dtype)
+        sim.object.data = clamp_amplitude(sim.object.data, None if self.min is None else cast(self.min), None if self.max is None else cast(self.max))
         return (sim, None)
 
 
-@partial(jit, donate_argnames=('obj',), cupy_fuse=True)
-def clamp_amplitude(obj: NDArray[numpy.complexfloating], amplitude: t.Union[float, numpy.floating]) -> NDArray[numpy.complexfloating]:
+@partial(jit, donate_argnames=('obj',), cupy_fuse=False)
+def clamp_amplitude(
+    obj: NDArray[numpy.complexfloating],
+    min: t.Union[float, numpy.floating, None],
+    max: t.Union[float, numpy.floating, None]
+) -> NDArray[numpy.complexfloating]:
     xp = get_array_module(obj)
 
     obj_amp = xp.abs(obj)
-    scale = xp.minimum(obj_amp, amplitude) / obj_amp
-    return obj * scale
+    new_amp = obj_amp
 
+    if min is not None and max is not None:
+        new_amp = xp.clip(new_amp, min, max)
+    elif min is not None:
+        new_amp = xp.maximum(new_amp, min)
+    elif max is not None:
+        new_amp = xp.minimum(new_amp, max)
+    else:
+        return obj
+
+    scale = xp.where(obj_amp > 0, new_amp / obj_amp, 0.0) #no divide by 0
+    return obj * scale
 
 class LimitProbeSupport:
     def __init__(self, args: None, props: LimitProbeSupportProps):
@@ -83,6 +105,34 @@ class RemovePhaseRamp:
         return (sim, state)
 
 
+
+@partial(jit, donate_argnames=('obj',), cupy_fuse=True)
+def non_neg_phase(obj: NDArray[numpy.complexfloating], weight: t.Union[float, numpy.floating]) -> NDArray[numpy.complexfloating]:
+    """
+    weight: between 0-1
+    """
+    xp = get_array_module(obj)
+    obj_phase = xp.angle(obj)
+    obj_phase = weight * xp.maximum(obj_phase, 0) + (1-weight) * obj_phase
+
+    return xp.abs(obj) * xp.exp(1j * obj_phase)
+
+
+class NonNegObjectPhase:
+    def __init__(self, args: None, props: NonNegObjectPhaseProps):
+        self.weight: float = props.weight
+
+    def init_state(self, sim: ReconsState) -> None:
+        return None
+
+    def apply_group(self, group: NDArray[numpy.integer], sim: ReconsState, state: None) -> t.Tuple[ReconsState, None]:
+        return self.apply_iter(sim, state)
+
+    def apply_iter(self, sim: ReconsState, state: None) -> t.Tuple[ReconsState, None]:
+        sim.object.data = non_neg_phase(sim.object.data, self.weight)
+        return (sim, None)
+
+
 class RegularizeLayers:
     def __init__(self, args: None, props: RegularizeLayersProps):
         self.weight = props.weight
@@ -93,7 +143,6 @@ class RegularizeLayers:
 
     def apply_iter(self, sim: ReconsState, state: None) -> t.Tuple[ReconsState, None]:
         xp = get_array_module(sim.object.data)
-        scipy = get_scipy_module(sim.object.data)
         dtype = to_real_dtype(sim.object.data)
 
         if len(sim.object.thicknesses) < 2:
@@ -112,17 +161,9 @@ class RegularizeLayers:
 
         # we convolve the log of object, because the transmission
         # function is multiplicative, not additive
-
-        if xp_is_jax(xp):
-            new_obj = xp.exp(scipy.signal.convolve(
-                xp.pad(xp.log(sim.object.data), ((r, r), (0, 0), (0, 0)), mode='edge'),
-                kernel[:, None, None],
-                mode="valid"
-            ))
-        else:
-            new_obj = xp.exp(scipy.ndimage.convolve1d(xp.log(
-                sim.object.data
-            ), kernel, axis=0, mode='nearest'))
+        new_obj = xp.exp(convolve1d(xp.log(
+            sim.object.data
+        ), kernel, axis=0, mode='nearest'))
 
         assert new_obj.shape == sim.object.data.shape
         assert new_obj.dtype == sim.object.data.dtype
@@ -196,6 +237,10 @@ class ObjL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
 
+    @staticmethod
+    def name() -> str:
+        return 'obj_l1'
+
     def init_state(self, sim: ReconsState) -> None:
         return None
 
@@ -205,13 +250,17 @@ class ObjL1:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(xp.abs(sim.object.data - 1.0))
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
         return (cost * cost_scale * self.cost, state)
 
 
 class ObjL2:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: Float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'obj_l2'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -222,13 +271,18 @@ class ObjL2:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(abs2(sim.object.data - 1.0))
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
-        return (cost * cost_scale * self.cost, state)
+
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
+        return (cost * cost_scale * self.cost, state)  # type: ignore
 
 
 class ObjPhaseL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'obj_phase_l1'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -239,13 +293,17 @@ class ObjPhaseL1:
         xp = get_array_module(sim.object.data)
 
         cost = xp.sum(xp.abs(xp.angle(sim.object.data)))
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
         return (cost * cost_scale * self.cost, state)
 
 
 class ObjRecipL1:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'obj_recip_l1'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -261,7 +319,7 @@ class ObjRecipL1:
             xp.abs(fft2(xp.prod(sim.object.data, axis=0)))
         )
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -270,6 +328,10 @@ class ObjTotalVariation:
     def __init__(self, args: None, props: TVRegularizerProps):
         self.cost: float = props.cost
         self.eps: float = props.eps
+
+    @staticmethod
+    def name() -> str:
+        return 'obj_tv'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -289,7 +351,7 @@ class ObjTotalVariation:
         #)
         # scale cost by fraction of the total reconstruction in the group
         # TODO also scale by # of pixels or similar?
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -297,6 +359,10 @@ class ObjTotalVariation:
 class ObjTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'obj_tikh'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -311,14 +377,18 @@ class ObjTikhonov:
             xp.sum(abs2(xp.diff(sim.object.data, axis=-2)))
         )
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
 
-        return (cost * cost_scale * self.cost, state)
+        return (cost * cost_scale * self.cost, state)  # type: ignore
 
 
 class LayersTotalVariation:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'layers_tv'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -333,7 +403,7 @@ class LayersTotalVariation:
 
         cost = xp.sum(xp.abs(xp.diff(sim.object.data, axis=0)))
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
 
         return (cost * cost_scale * self.cost, state)
 
@@ -341,6 +411,10 @@ class LayersTotalVariation:
 class LayersTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'layers_tikh'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -355,14 +429,18 @@ class LayersTikhonov:
 
         cost = xp.sum(abs2(xp.diff(sim.object.data, axis=0)))
         # scale cost by fraction of the total reconstruction in the group
-        cost_scale = (group.shape[-1] / numpy.prod(sim.scan.shape[:-1])).astype(cost.dtype)
+        cost_scale = xp.array(group.shape[-1] / prod(sim.scan.data.shape[:-1]), dtype=cost.dtype)
 
-        return (cost * cost_scale * self.cost, state)
+        return (cost * cost_scale * self.cost, state)  # type: ignore
 
 
 class ProbePhaseTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
+
+    @staticmethod
+    def name() -> str:
+        return 'probe_phase_tikh'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -387,6 +465,10 @@ class ProbeRecipTikhonov:
     def __init__(self, args: None, props: CostRegularizerProps):
         self.cost: float = props.cost
 
+    @staticmethod
+    def name() -> str:
+        return 'probe_recip_tikh'
+
     def init_state(self, sim: ReconsState) -> None:
         return None
 
@@ -409,6 +491,10 @@ class ProbeRecipTotalVariation:
     def __init__(self, args: None, props: TVRegularizerProps):
         self.cost: float = props.cost
         self.eps: float = props.eps
+
+    @staticmethod
+    def name() -> str:
+        return 'probe_recip_tv'
 
     def init_state(self, sim: ReconsState) -> None:
         return None
@@ -433,7 +519,7 @@ class UnstructuredGaussian:
         self.attr_path = props.attr_path
 
     def init_state(self, sim: ReconsState) -> NDArray[numpy.floating]:
-        xp = get_array_module(sim.scan)
+        xp = get_array_module(sim.scan.data)
         try:
             self.getattr_nested(sim, self.attr_path)
         except AttributeError as e:
@@ -461,8 +547,8 @@ class UnstructuredGaussian:
     def apply_iter(self, sim: ReconsState, state: NDArray[numpy.floating]) -> t.Tuple[ReconsState, NDArray[numpy.floating]]:
         from scipy.spatial import KDTree
         obj_samp = sim.object.sampling
-        scan_flat = sim.scan.reshape(-1, 2)
-        scan_ndim = sim.scan.ndim - 1
+        scan_flat = sim.scan.data.reshape(-1, 2)
+        scan_ndim = sim.scan.data.ndim - 1
 
         attr = self.getattr_nested(sim, self.attr_path)
         vals = t.cast(NDArray[numpy.inexact], getattr(attr, 'data', attr))  # Extract raw array

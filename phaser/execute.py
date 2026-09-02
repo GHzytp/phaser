@@ -2,19 +2,22 @@ import dataclasses
 import itertools
 import logging
 import math
+import sys
 import typing as t
 
+from frozendict import frozendict
 import numpy
 import pane
 
 from phaser.types import EarlyTermination
-from phaser.utils.num import cast_array_module, get_array_module, get_backend_module, xp_is_jax, Sampling, to_complex_dtype
+from phaser.utils.num import Device, cast_array_module, get_array_module, get_backend_devices, get_backend_module, set_default_device, to_device, xp_is_jax, Sampling, to_complex_dtype, xp_is_torch
 from phaser.utils.object import ObjectSampling
-from phaser.utils.misc import unwrap
+from phaser.utils.misc import freeze, unwrap
 from .hooks import EngineHook, Hook, ObjectHook, RawData
 from .plan import GradientEnginePlan, ReconsPlan, EnginePlan, ScanHook, ProbeHook, TiltHook
-from .state import Patterns, ReconsState, PartialReconsState, IterState, ProgressState, PreparedRecons
+from .state import Patterns, ReconsState, PartialReconsState, IterState, PreparedRecons, ScanState
 from .observer import Observer, LoggingObserver, PatienceObserver, SaveObserver, ObserverSet
+from .version import version_info
 
 
 def execute_plan(
@@ -24,6 +27,9 @@ def execute_plan(
     observers: t.Union[Observer, t.Iterable[Observer], None] = None,
     override_observers: t.Union[Observer, t.Iterable[Observer], None] = None,
 ):
+    logging.basicConfig(level=logging.INFO)
+    logging.info(str(version_info()))
+
     recons = initialize_reconstruction(
         plan, xp=xp, seed=seed, name=name, init_state=init_state,
         observers=observers, override_observers=override_observers
@@ -42,7 +48,8 @@ def execute_plan(
         recons.observer.finish_recons(recons.state)
         logging.info("Reconstruction finished!")
     finally:
-        recons.observer.close()
+        # pass any excpetion info to observers
+        recons.observer.close(sys.exc_info()[1])
 
 
 def execute_engine(
@@ -50,7 +57,7 @@ def execute_engine(
     engine: EngineHook,
 ) -> PreparedRecons:
     xp = get_array_module(recons.state.object.data, recons.state.probe.data)
-    dtype = recons.patterns.patterns.dtype
+    dtype = recons.patterns.patterns.dtype.type
     plan = t.cast(EnginePlan, engine.props)
 
     engine_i = recons.state.iter.engine_num
@@ -130,11 +137,13 @@ def _normalize_scan_shape(
     Normalizes 'patterns' and 'state' to share a common scan shape.
 
     Requires that there are an equal number of patterns and scan positions.
-    Reshapes 'state.scan' and 'patterns' to match shape, choosing the highest
-    dimensional shape of the two. 'state.tilt' is reshaped as well.
+    Reshapes 'state.scan' (scan and tilt) and 'patterns' to match shape,
+    choosing the highest dimensional shape of the two.
     """
+    scan = state.scan
+
     patterns_shape = patterns.patterns.shape[:-2]
-    scan_shape = state.scan.shape[:-1]
+    scan_shape = scan.data.shape[:-1]
 
     n_patterns = math.prod(patterns_shape)
     n_scan = math.prod(scan_shape)
@@ -145,14 +154,22 @@ def _normalize_scan_shape(
     new_shape = scan_shape if len(scan_shape) > len(patterns_shape) else patterns_shape
 
     patterns.patterns = patterns.patterns.reshape((*new_shape, *patterns.patterns.shape[-2:]))
-    state.scan = state.scan.reshape((*new_shape, 2))
+    scan.data = scan.data.reshape((*new_shape, 2))
+    scan.initial = scan.initial.reshape((*new_shape, 2))
 
-    if state.tilt is not None:
-        n_tilt = math.prod(state.tilt.shape[:-1])
+    if scan.tilt is not None:
+        n_tilt = math.prod(scan.tilt.shape[:-1])
         if n_tilt != n_patterns:
             raise ValueError(f"# of tilt positions {n_scan} doesn't match # of patterns {n_patterns}")
 
-        state.tilt = state.tilt.reshape((*new_shape, 2))
+        scan.tilt = scan.tilt.reshape((*new_shape, 2))
+
+    # also normalize raster_rows and raster_cols metadata
+    scan.meta = frozendict(
+        scan.meta,
+        **({'raster_rows': freeze(numpy.array(scan.meta['raster_rows']).reshape(new_shape))} if 'raster_rows' in scan.meta else {}),
+        **({'raster_cols': freeze(numpy.array(scan.meta['raster_cols']).reshape(new_shape))} if 'raster_cols' in scan.meta else {}),
+    )
 
     return patterns, state
 
@@ -178,15 +195,15 @@ def load_raw_data(
 
     raw_data['scan_hook'] = pane.into_data(merge(  # type: ignore
         pane.from_data(t.cast(dict, raw_data.get('scan_hook', None)), ScanHook) if raw_data.get('scan_hook', None) is not None else None,
-        _MISSING if plan.init.scan in (None, {}) else plan.init.scan
+        None if plan.init.scan in (None, {}) else plan.init.scan
     ))
     raw_data['tilt_hook'] = pane.into_data(merge(  # type: ignore
         pane.from_data(t.cast(dict, raw_data.get('tilt_hook', None)), TiltHook) if raw_data.get('tilt_hook', None) is not None else None,
-        _MISSING if plan.init.tilt in (None, {}) else plan.init.tilt
+        None if plan.init.tilt in (None, {}) else plan.init.tilt
     ))
     raw_data['probe_hook'] = pane.into_data(merge(  # type: ignore
         pane.from_data(t.cast(dict, raw_data.get('probe_hook', None)), ProbeHook) if raw_data.get('probe_hook', None) is not None else None,
-        _MISSING if plan.init.probe in (None, {}) else plan.init.probe
+        None if plan.init.probe in (None, {}) else plan.init.probe
     ))
     #print(f"scan_hook: {raw_data['scan_hook']}")
     #print(f"probe_hook: {raw_data['probe_hook']}")
@@ -223,16 +240,36 @@ def load_raw_data(
 
 
 def initialize_reconstruction(
-    plan: ReconsPlan, *, xp: t.Any = None, seed: t.Any = None,
-    name: t.Optional[str] = None,
+    plan: ReconsPlan, *, xp: t.Any = None, device: t.Optional[Device] = None,
+    seed: t.Any = None, name: t.Optional[str] = None,
     init_state: t.Union[ReconsState, PartialReconsState, None] = None,
     observers: t.Union[Observer, t.Iterable[Observer], None] = None,
     override_observers: t.Union[Observer, t.Iterable[Observer], None] = None,
 ) -> PreparedRecons:
-    xp = cast_array_module(get_backend_module(plan.backend) if xp is None else xp)
+    logging.basicConfig(level=logging.INFO)
+
+    if xp is not None:
+        xp = cast_array_module(xp)
+        # TODO: nicer output here
+        logging.info(f"Using manually-specified backend {xp}")
+        devices = get_backend_devices(xp)
+        logging.info(f"Available devices: {list(devices)}")
+        manual = device is not None
+        device = to_device(device, xp) if device is not None else devices[0]
+        logging.info(f"Using {'manually-specified ' if manual else ''}device {device}")
+    else:
+        xp = get_backend_module(plan.backend)
+        logging.info(f"Using {'plan-specified' if plan.backend is not None else 'default'} backend {xp}")
+        devices = get_backend_devices(xp)
+        logging.info(f"Available devices: {list(devices)}")
+
+        device = to_device(plan.device, xp) if plan.device is not None else devices[0]
+        logging.info(f"Using {'plan-specified ' if plan.device is not None else ''}device {device}")
+
+    set_default_device(device, xp)
+
     observer = _normalize_observers(observers, override_observers)
 
-    logging.basicConfig(level=logging.INFO)
     logging.info("Executing plan...")
     observer.init_recons(plan)
 
@@ -284,27 +321,27 @@ def initialize_reconstruction(
 
     if init_state.scan is not None and plan.init.scan is None:
         logging.info("Re-using scan from initial state...")
-        scan = init_state.scan
+        scan = init_state.scan.copy()
+        scan.data = scan.data.astype(dtype)
+        scan.initial = scan.initial.astype(dtype)
     else:
         logging.info("Initializing scan...")
         scan = pane.from_data(scan_hook, ScanHook)(  # type: ignore
             {'dtype': dtype, 'seed': seed, 'xp': xp}
         )
 
-    if init_state.tilt is not None and plan.init.tilt is None:
+    if init_state.scan is not None and init_state.scan.tilt is not None and plan.init.tilt is None:
         logging.info("Re-using tilt from initial state...")
-        tilt = init_state.tilt
+        scan.tilt = init_state.scan.tilt.astype(dtype)
     elif tilt_hook is not None:
         logging.info("Initializing tilt...")
-        tilt = pane.from_data(tilt_hook, TiltHook)(  # type: ignore
-            {'dtype': dtype, 'xp': xp, 'shape': scan.shape[:-1]}
+        scan.tilt = pane.from_data(tilt_hook, TiltHook)(  # type: ignore
+            {'dtype': dtype, 'xp': xp, 'shape': scan.data.shape[:-1]}
         )
-    else:
-        tilt = None
 
     obj_pad_px: float = plan.engines[0].obj_pad_px if len(plan.engines) > 0 else 5.0  # type: ignore
     obj_sampling = ObjectSampling.from_scan(
-        scan, sampling.sampling, sampling.extent / 2. + obj_pad_px * sampling.sampling
+        scan.data, sampling.sampling, sampling.extent / 2. + obj_pad_px * sampling.sampling
     )
 
     if init_state.object is not None and plan.init.object is None:
@@ -313,6 +350,7 @@ def initialize_reconstruction(
         obj.data = obj.data.astype(cdtype)
     else:
         logging.info("Initializing object...")
+
         obj = (plan.init.object or pane.from_data('random', ObjectHook))({
             'sampling': obj_sampling, 'slices': plan.slices, 'wavelength': wavelength,
             'dtype': dtype, 'seed': seed, 'xp': xp
@@ -326,10 +364,9 @@ def initialize_reconstruction(
         probe=probe,
         object=obj,
         scan=scan,
-        tilt=tilt,
-        progress=ProgressState(iters=numpy.array([]), detector_errors=numpy.array([])),
         wavelength=wavelength
     )
+    state = state.to_xp(xp)  # TODO: figure out why this isn't already the case
     data, state = _normalize_scan_shape(data, state)
 
     # process post_init hooks
@@ -360,8 +397,8 @@ def initialize_reconstruction(
 
 def prepare_for_engine(patterns: Patterns, state: ReconsState, xp: t.Any, engine: EnginePlan) -> t.Tuple[Patterns, ReconsState]:
     # TODO: more graceful
-    if isinstance(engine, GradientEnginePlan) and not xp_is_jax(xp):
-        raise ValueError("The gradient descent engine requires the jax backend.")
+    if isinstance(engine, GradientEnginePlan) and not (xp_is_jax(xp) or xp_is_torch(xp)):
+        raise ValueError("The gradient descent engine requires the 'jax' or 'torch' backend.")
 
     state = state.to_xp(xp)
 
@@ -388,7 +425,7 @@ def prepare_for_engine(patterns: Patterns, state: ReconsState, xp: t.Any, engine
         obj_sampling = obj_sampling.with_sampling(state.probe.sampling.sampling)
 
     obj_sampling_pad = obj_sampling.expand_to_scan(
-        state.scan, state.probe.sampling.extent / 2. + engine.obj_pad_px * state.probe.sampling.sampling
+        state.scan.data, state.probe.sampling.extent / 2. + engine.obj_pad_px * state.probe.sampling.sampling
     )
 
     if obj_sampling_pad != obj_sampling:
@@ -422,14 +459,14 @@ def prepare_for_engine(patterns: Patterns, state: ReconsState, xp: t.Any, engine
 
     if isinstance(engine, GradientEnginePlan):
         solver_vars = set(itertools.chain.from_iterable(engine.solvers.keys()))
-        if 'tilt' in solver_vars and state.tilt is None:
+        if 'tilt' in solver_vars and state.scan.tilt is None:
             logging.info("Creating new, zeroed tilt map...")
-            state.tilt = xp.zeros_like(state.scan)
+            state.scan.tilt = xp.zeros_like(state.scan.data)
 
     return patterns, state
 
 
-_MISSING = object()
+#_MISSING = object()
 
 
 def merge(left: t.Any, right: t.Any) -> t.Any:
@@ -442,21 +479,21 @@ def merge(left: t.Any, right: t.Any) -> t.Any:
             return val.dict(set_only=True)
         return None
 
-    if left is _MISSING or right is _MISSING:
-        return left if right is _MISSING else right
+    if left is None or right is None:
+        return left if right is None else right
 
     if isinstance(left, Hook) and isinstance(right, Hook):
         if left.ref != right.ref:
             return right
         d = merge(left.props or {}, right.props or {})
         d['type'] = right.type if right.type is not None else right.ref
-        return pane.from_data(d, right.__class__)
+        return pane.convert(d, right.__class__)
 
     if (left_d := _as_dict(left)) is not None and (right_d := _as_dict(right)) is not None:
         keys = set(left_d.keys()) | set(right_d.keys())
-        return {k: merge(left_d.get(k, _MISSING), right_d.get(k, _MISSING)) for k in keys}
+        return {k: merge(left_d.get(k, None), right_d.get(k, None)) for k in keys}
 
-    return left if right is _MISSING else right
+    return left if right is None else right
 
 
 __all__ = [
